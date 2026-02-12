@@ -1,0 +1,511 @@
+"""
+Chương trình nhận diện vật thể trong game bắn súng
+Sử dụng YOLOv8 và OpenCV để phát hiện đối tượng trong thời gian thực
+"""
+
+import cv2
+import numpy as np
+from mss import mss
+import time
+import pyautogui
+import sys
+import platform
+
+# Cấu hình pyautogui để tránh lỗi fail-safe
+pyautogui.FAILSAFE = True  # Di chuyển chuột vào góc màn hình để dừng
+pyautogui.PAUSE = 0.001  # Giảm delay giữa các lệnh
+
+# Import Windows API nếu chạy trên Windows
+if platform.system() == 'Windows':
+    import win32gui
+    import win32con
+    import win32api
+
+def setup_transparent_overlay(window_name):
+    """
+    Thiết lập cửa sổ overlay transparent, always on top, click-through
+    Chỉ hoạt động trên Windows
+    """
+    if platform.system() != 'Windows':
+        print("⚠ Chức năng overlay chỉ hỗ trợ Windows")
+        return None
+    
+    try:
+        # Tìm window handle
+        hwnd = win32gui.FindWindow(None, window_name)
+        if hwnd == 0:
+            print(f"⚠ Không tìm thấy cửa sổ: {window_name}")
+            return None
+        
+        # Lấy extended window style
+        ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+        
+        # Set window style: Always on top + Transparent + Click-through
+        # WS_EX_TOPMOST: Always on top
+        # WS_EX_TRANSPARENT: Click-through (chuột xuyên qua)
+        # WS_EX_LAYERED: Cho phép transparency
+        ex_style = ex_style | win32con.WS_EX_TOPMOST | win32con.WS_EX_TRANSPARENT | win32con.WS_EX_LAYERED
+        
+        # Apply style
+        win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, ex_style)
+        
+        # Set transparency (0-255, 0 = hoàn toàn trong suốt, 255 = không trong suốt)
+        # 200 = hơi trong suốt, vẫn nhìn thấy rõ
+        win32gui.SetLayeredWindowAttributes(hwnd, 0, 200, win32con.LWA_ALPHA)
+        
+        # Set window position: Always on top
+        win32gui.SetWindowPos(
+            hwnd,
+            win32con.HWND_TOPMOST,  # Always on top
+            0, 0, 0, 0,
+            win32con.SWP_NOMOVE | win32con.SWP_NOSIZE
+        )
+        
+        # Loại bỏ border và title bar
+        style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+        style = style & ~win32con.WS_CAPTION & ~win32con.WS_THICKFRAME
+        win32gui.SetWindowLong(hwnd, win32con.GWL_STYLE, style)
+        
+        print("✓ Đã kích hoạt overlay mode:")
+        print("  - Always on top")
+        print("  - Click-through (chuột xuyên qua)")
+        print("  - Transparent (độ trong suốt 200/255)")
+        
+        return hwnd
+    except Exception as e:
+        print(f"⚠ Lỗi khi thiết lập overlay: {e}")
+        return None
+
+def set_fullscreen_borderless(window_name):
+    """
+    Đặt cửa sổ thành fullscreen borderless
+    """
+    if platform.system() != 'Windows':
+        return None
+    
+    try:
+        hwnd = win32gui.FindWindow(None, window_name)
+        if hwnd == 0:
+            return None
+        
+        # Lấy kích thước màn hình
+        screen_width = win32api.GetSystemMetrics(0)
+        screen_height = win32api.GetSystemMetrics(1)
+        
+        # Set fullscreen borderless
+        win32gui.SetWindowPos(
+            hwnd,
+            win32con.HWND_TOPMOST,
+            0, 0,
+            screen_width, screen_height,
+            win32con.SWP_SHOWWINDOW
+        )
+        
+        print(f"✓ Fullscreen borderless: {screen_width}x{screen_height}")
+        return hwnd
+    except Exception as e:
+        print(f"⚠ Lỗi khi set fullscreen: {e}")
+        return None
+
+class GameObjectDetector:
+    def __init__(self, confidence_threshold=0.5, auto_aim=False, sensitivity=1.0, overlay_mode=True):
+        """
+        Khởi tạo bộ nhận diện vật thể
+        
+        Args:
+            confidence_threshold: Ngưỡng tin cậy tối thiểu để phát hiện
+            auto_aim: Bật/tắt tự động quay camera về mục tiêu
+            sensitivity: Độ nhạy di chuyển chuột (0.1 - 2.0)
+            overlay_mode: Bật chế độ overlay (always on top, click-through, transparent)
+        """
+        self.confidence_threshold = confidence_threshold
+        self.auto_aim = auto_aim
+        self.sensitivity = sensitivity
+        self.overlay_mode = overlay_mode
+        
+        # Cấu hình vùng capture màn hình (có thể điều chỉnh)
+        self.monitor = {"top": 0, "left": 0, "width": 1920, "height": 1080}
+        self.sct = mss()
+        
+        # Load YOLO model (cần cài đặt ultralytics)
+        # pip install ultralytics
+        try:
+            from ultralytics import YOLO
+            # Sử dụng model YOLOv8 (tải tự động nếu chưa có)
+            self.model = YOLO('yolov8n.pt')  # 'n' = nano (nhanh nhất)
+            print("✓ Đã load model YOLO thành công")
+        except ImportError:
+            print("⚠ Cần cài đặt: pip install ultralytics")
+            self.model = None
+        
+        # Các lớp đối tượng cần phát hiện (tùy chỉnh theo game)
+        self.target_classes = ['person', 'car', 'truck', 'motorcycle', 'airplane']
+        
+        # Màu sắc cho các bounding box
+        self.colors = {
+            'person': (0, 255, 0),      # Xanh lá
+            'car': (255, 0, 0),          # Đỏ
+            'truck': (0, 0, 255),        # Xanh dương
+            'motorcycle': (255, 255, 0), # Vàng
+            'airplane': (255, 0, 255)    # Tím
+        }
+        
+    def capture_screen(self):
+        """Chụp màn hình game"""
+        screenshot = self.sct.grab(self.monitor)
+        img = np.array(screenshot)
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        return img
+    
+    def detect_objects(self, frame):
+        """
+        Phát hiện vật thể trong frame
+        
+        Returns:
+            frame: Frame đã được vẽ bounding box
+            detections: Danh sách các đối tượng phát hiện được
+        """
+        if self.model is None:
+            return frame, []
+        
+        # Chạy detection
+        results = self.model(frame, conf=self.confidence_threshold, verbose=False)
+        
+        detections = []
+        
+        # Xử lý kết quả
+        for result in results:
+            boxes = result.boxes
+            
+            for box in boxes:
+                # Lấy thông tin box
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                conf = box.conf[0].cpu().numpy()
+                cls = int(box.cls[0].cpu().numpy())
+                
+                # Lấy tên class
+                class_name = self.model.names[cls]
+                
+                # Chỉ xử lý các đối tượng mục tiêu
+                if class_name in self.target_classes:
+                    # Tính toán tâm của box
+                    center_x = int((x1 + x2) / 2)
+                    center_y = int((y1 + y2) / 2)
+                    
+                    detection_info = {
+                        'class': class_name,
+                        'confidence': float(conf),
+                        'bbox': (int(x1), int(y1), int(x2), int(y2)),
+                        'center': (center_x, center_y)
+                    }
+                    detections.append(detection_info)
+        
+        # KHÔNG vẽ gì lên frame ở đây nữa
+        # Tất cả sẽ được vẽ trong hàm run()
+        return frame, detections
+    
+    def find_nearest_target(self, detections, screen_center):
+        """
+        Tìm mục tiêu gần tâm màn hình nhất
+        
+        Args:
+            detections: Danh sách các đối tượng
+            screen_center: Tọa độ tâm màn hình
+        
+        Returns:
+            Thông tin mục tiêu gần nhất hoặc None
+        """
+        if not detections:
+            return None
+        
+        min_distance = float('inf')
+        nearest = None
+        
+        for detection in detections:
+            # Tính khoảng cách từ tâm đối tượng đến tâm màn hình
+            dx = detection['center'][0] - screen_center[0]
+            dy = detection['center'][1] - screen_center[1]
+            distance = np.sqrt(dx**2 + dy**2)
+            
+            if distance < min_distance:
+                min_distance = distance
+                nearest = detection
+                nearest['distance'] = distance
+        
+        return nearest
+    
+    def auto_aim_to_target(self, target, screen_center, smooth=True):
+        """
+        Tự động di chuyển chuột đến mục tiêu
+        
+        Args:
+            target: Thông tin mục tiêu (có 'center')
+            screen_center: Tâm màn hình
+            smooth: Sử dụng di chuyển mượt mà
+        """
+        if not target or not self.auto_aim:
+            return
+        
+        # Tính offset cần di chuyển
+        offset_x = target['center'][0] - screen_center[0]
+        offset_y = target['center'][1] - screen_center[1]
+        
+        # Áp dụng độ nhạy
+        move_x = offset_x * self.sensitivity
+        move_y = offset_y * self.sensitivity
+        
+        # Vùng chết (dead zone) - không di chuyển nếu quá gần tâm
+        dead_zone = 10
+        if abs(offset_x) < dead_zone and abs(offset_y) < dead_zone:
+            return
+        
+        # Di chuyển chuột
+        try:
+            if smooth:
+                # Di chuyển mượt với thời gian ngắn
+                duration = 0.05  # 50ms
+                pyautogui.moveRel(move_x, move_y, duration=duration)
+            else:
+                # Di chuyển ngay lập tức
+                pyautogui.moveRel(move_x, move_y, duration=0)
+        except Exception as e:
+            print(f"⚠ Lỗi di chuyển chuột: {e}")
+    
+    def run(self, show_fps=True):
+        """
+        Chạy vòng lặp nhận diện chính
+        
+        Args:
+            show_fps: Hiển thị FPS trên màn hình
+        """
+        print("🎮 Bắt đầu nhận diện vật thể trong game...")
+        print("=" * 60)
+        print("PHÍM ĐIỀU KHIỂN:")
+        print("  Q: Thoát chương trình")
+        print("  S: Chụp ảnh màn hình")
+        print("  A: Bật/tắt Auto-Aim")
+        print("  +: Tăng độ nhạy")
+        print("  -: Giảm độ nhạy")
+        print("  O: Bật/tắt Overlay Mode")
+        print("  T: Điều chỉnh độ trong suốt")
+        print("=" * 60)
+        print(f"⚙️  Auto-Aim: {'BẬT' if self.auto_aim else 'TẮT'}")
+        print(f"⚙️  Sensitivity: {self.sensitivity:.2f}")
+        print(f"⚙️  Overlay Mode: {'BẬT' if self.overlay_mode else 'TẮT'}")
+        print("=" * 60)
+        
+        # Tên cửa sổ
+        window_name = 'Game Object Detection - Overlay'
+        
+        # Tạo cửa sổ với flag fullscreen
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        
+        # Lấy kích thước màn hình thực tế
+        if platform.system() == 'Windows':
+            screen_width = win32api.GetSystemMetrics(0)
+            screen_height = win32api.GetSystemMetrics(1)
+        else:
+            screen_width = self.monitor['width']
+            screen_height = self.monitor['height']
+        
+        screen_center = (screen_width // 2, screen_height // 2)
+        
+        # Wait một chút để window được tạo
+        cv2.waitKey(100)
+        
+        # Setup overlay mode nếu được bật
+        hwnd = None
+        if self.overlay_mode and platform.system() == 'Windows':
+            hwnd = setup_transparent_overlay(window_name)
+            if hwnd:
+                set_fullscreen_borderless(window_name)
+        
+        frame_count = 0
+        start_time = time.time()
+        transparency_level = 200  # 0-255
+        
+        while True:
+            # Chụp màn hình
+            frame = self.capture_screen()
+            
+            # Phát hiện vật thể
+            processed_frame, detections = self.detect_objects(frame)
+            
+            # Tìm mục tiêu gần nhất
+            nearest_target = self.find_nearest_target(detections, screen_center)
+            
+            # Nếu ở overlay mode, tạo nền đen hoàn toàn
+            if self.overlay_mode:
+                # Tạo một frame đen hoàn toàn (nền trong suốt)
+                overlay = np.zeros((frame.shape[0], frame.shape[1], 3), dtype=np.uint8)
+            else:
+                # Normal mode - hiển thị màn hình game
+                overlay = processed_frame.copy()
+            
+            # Vẽ tất cả các detection lên overlay
+            for detection in detections:
+                class_name = detection['class']
+                conf = detection['confidence']
+                x1, y1, x2, y2 = detection['bbox']
+                center_x, center_y = detection['center']
+                
+                # Vẽ bounding box
+                color = self.colors.get(class_name, (0, 255, 0))
+                cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
+                
+                # Vẽ nhãn
+                label = f"{class_name}: {conf:.2f}"
+                cv2.putText(overlay, label, (x1, y1 - 10),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                
+                # Vẽ tâm của detection
+                cv2.circle(overlay, (center_x, center_y), 5, (0, 0, 255), -1)
+                cv2.drawMarker(overlay, (center_x, center_y), (255, 255, 255),
+                             cv2.MARKER_CROSS, 20, 2)
+            
+            # Auto-aim nếu được bật
+            if self.auto_aim and nearest_target:
+                self.auto_aim_to_target(nearest_target, screen_center, smooth=True)
+                
+                # Vẽ đường kẻ từ tâm đến mục tiêu
+                cv2.line(overlay, screen_center, nearest_target['center'],
+                        (0, 255, 255), 2)
+                
+                # Vẽ vòng tròn nhấn mạnh mục tiêu
+                cv2.circle(overlay, nearest_target['center'], 
+                          30, (0, 255, 255), 2)
+            
+            # Hiển thị thông tin mục tiêu
+            if nearest_target:
+                info_text = f"Target: {nearest_target['class']} | " \
+                           f"Distance: {nearest_target['distance']:.0f}px | " \
+                           f"Conf: {nearest_target['confidence']:.2f}"
+                cv2.putText(overlay, info_text, (10, 30),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            
+            # Hiển thị FPS
+            if show_fps:
+                frame_count += 1
+                elapsed_time = time.time() - start_time
+                fps = frame_count / elapsed_time
+                cv2.putText(overlay, f"FPS: {fps:.1f}", (10, 60),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+            # Hiển thị số lượng phát hiện
+            cv2.putText(overlay, f"Detected: {len(detections)}", (10, 90),
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+            
+            # Hiển thị trạng thái Auto-Aim
+            auto_aim_status = "AUTO-AIM: ON" if self.auto_aim else "AUTO-AIM: OFF"
+            auto_aim_color = (0, 255, 0) if self.auto_aim else (0, 0, 255)
+            cv2.putText(overlay, auto_aim_status, (10, 120),
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, auto_aim_color, 2)
+            
+            # Hiển thị độ nhạy
+            cv2.putText(overlay, f"Sensitivity: {self.sensitivity:.2f}", (10, 150),
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            
+            # Hiển thị Overlay mode
+            overlay_status = "OVERLAY: ON" if self.overlay_mode else "OVERLAY: OFF"
+            overlay_color = (0, 255, 255) if self.overlay_mode else (128, 128, 128)
+            cv2.putText(overlay, overlay_status, (10, 180),
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, overlay_color, 2)
+            
+            # Vẽ crosshair tâm màn hình (to hơn và nổi bật hơn)
+            crosshair_size = 40
+            crosshair_thickness = 3
+            crosshair_color = (0, 255, 255)  # Vàng cyan
+            
+            # Vẽ chữ thập
+            cv2.line(overlay, 
+                    (screen_center[0] - crosshair_size, screen_center[1]),
+                    (screen_center[0] + crosshair_size, screen_center[1]),
+                    crosshair_color, crosshair_thickness)
+            cv2.line(overlay, 
+                    (screen_center[0], screen_center[1] - crosshair_size),
+                    (screen_center[0], screen_center[1] + crosshair_size),
+                    crosshair_color, crosshair_thickness)
+            
+            # Vẽ vòng tròn ở tâm
+            cv2.circle(overlay, screen_center, 5, crosshair_color, -1)
+            cv2.circle(overlay, screen_center, 25, crosshair_color, 2)
+            
+            # Hiển thị frame
+            display_frame = overlay
+            
+            # Resize về đúng kích thước màn hình nếu cần
+            if display_frame.shape[0] != screen_height or display_frame.shape[1] != screen_width:
+                display_frame = cv2.resize(display_frame, (screen_width, screen_height))
+            
+            cv2.imshow(window_name, display_frame)
+            
+            # Xử lý phím
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('s'):
+                filename = f"screenshot_{int(time.time())}.png"
+                cv2.imwrite(filename, overlay)
+                print(f"📸 Đã lưu: {filename}")
+            elif key == ord('a'):
+                self.auto_aim = not self.auto_aim
+                status = "BẬT" if self.auto_aim else "TẮT"
+                print(f"🎯 Auto-Aim: {status}")
+            elif key == ord('+') or key == ord('='):
+                self.sensitivity = min(2.0, self.sensitivity + 0.1)
+                print(f"⚙️  Sensitivity: {self.sensitivity:.2f}")
+            elif key == ord('-') or key == ord('_'):
+                self.sensitivity = max(0.1, self.sensitivity - 0.1)
+                print(f"⚙️  Sensitivity: {self.sensitivity:.2f}")
+            elif key == ord('o'):
+                self.overlay_mode = not self.overlay_mode
+                if self.overlay_mode and platform.system() == 'Windows':
+                    hwnd = setup_transparent_overlay(window_name)
+                    if hwnd:
+                        set_fullscreen_borderless(window_name)
+                else:
+                    # Tắt overlay mode - khôi phục cửa sổ bình thường
+                    if platform.system() == 'Windows' and hwnd:
+                        try:
+                            ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+                            ex_style = ex_style & ~win32con.WS_EX_TRANSPARENT & ~win32con.WS_EX_LAYERED
+                            win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, ex_style)
+                        except:
+                            pass
+                status = "BẬT" if self.overlay_mode else "TẮT"
+                print(f"👁️  Overlay Mode: {status}")
+            elif key == ord('t'):
+                if platform.system() == 'Windows' and hwnd and self.overlay_mode:
+                    transparency_level = (transparency_level + 50) % 300
+                    if transparency_level == 0:
+                        transparency_level = 50
+                    actual_level = min(255, transparency_level)
+                    win32gui.SetLayeredWindowAttributes(hwnd, 0, actual_level, win32con.LWA_ALPHA)
+                    print(f"🔍 Độ trong suốt: {actual_level}/255")
+        
+        # Dọn dẹp
+        cv2.destroyAllWindows()
+        print("\n✓ Kết thúc chương trình")
+
+
+def main():
+    """Hàm main"""
+    print("=" * 60)
+    print("🎯 CHƯƠNG TRÌNH NHẬN DIỆN VẬT THỂ TRONG GAME BẮN SÚNG")
+    print("=" * 60)
+    
+    # Khởi tạo detector với overlay mode BẬT
+    detector = GameObjectDetector(
+        confidence_threshold=0.4,
+        auto_aim=Trueq,     # Bật/tắt auto-aim (nhấn 'A' trong game để toggle)
+        sensitivity=2,    # Độ nhạy (0.1 - 2.0, dùng +/- để điều chỉnh)q
+        overlay_mode=True   # BẬT chế độ overlay (always on top, click-through)
+    )
+    
+    # Chạy detection
+    detector.run(show_fps=True)
+
+
+if __name__ == "__main__":
+    main()
